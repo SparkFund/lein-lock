@@ -1,6 +1,7 @@
 (ns leiningen.lock
   (:require [leiningen.core.classpath :as classpath]
             [leiningen.core.project :as project]
+            [leiningen.jar :as jar]
             [pandect.algo.sha1 :as pan]
             [clojure.data :as data]
             [clojure.java.io :as io]
@@ -9,18 +10,6 @@
 
 (def default-local-repo ;; cf pomegranate/aether.clj
   (io/file (System/getProperty "user.home") ".m2" "repository"))
-
-(defn relativize [project] ;; cf pom.xml
-  (let [root (str (:root project) (System/getProperty "file.separator"))]
-    (reduce #(update-in %1 [%2]
-                        (fn [xs]
-                          (if (sequential? xs)
-                            (vec (for [x xs]
-                                   (.replace x root "")))
-                            (and xs (.replace xs root "")))))
-            project
-            [:target-path :compile-path :source-paths :test-paths
-             :resource-paths :java-source-paths])))
 
 (defn jar-info
   "Breaks a jar deps path, assumes they're in a maven structured directory.
@@ -43,15 +32,17 @@
      :sha (pan/sha1 file)}))
 
 (defn flatten-mapvals
+  "flattens nested output from dependency-hierarchy"
   [graph]
   (if (some? graph)
     (mapcat (fn [[k v]] (cons k (flatten-mapvals v))) graph)
     ()))
 
 (defn parse-dependency-entry
-  "Aether gives a short-hand [symbol ver & kwdpairs] we want to parse back into
-  a map. groups and artifacts normalized to strings.
-   kwargs could include :exclusions and :scope, which will be nil if not present."
+  "Aether via dependency-hierarchy gives a short-hand [symbol ver & kwdpairs] we
+  want to parse back into a map. groups and artifacts normalized to strings.
+  kwargs could include :exclusions and :scope, which will be nil if not
+  present."
   [[name-sym version & kwargs]]
   (let [kws (apply hash-map kwargs)]
     {:version version
@@ -83,13 +74,55 @@
          (sort-by join-on hierarchy-list)
          (sort-by join-on resolve-list))))
 
-(defn lock
-  "I don't do a lot."
-  [project & args]
-  ;; Gives nil :(
-  (println "get-deps" (apply classpath/get-dependencies :dependencies project))
-  #_(prn  (map project/dependency-map (:dependencies project)))
-  (let [original-project (-> project meta ::original-project)
+(defn uberjar-jars
+  "cf uberjar.clj"
+  [project]
+  (let [scoped-profiles (set (project/pom-scope-profiles project :provided))
+        default-profiles (set (project/expand-profile project :default))
+        provided-profiles (remove
+                           (set/difference default-profiles scoped-profiles)
+                           (-> project meta :included-profiles))
+        project (update-in project [:jar-inclusions]
+                           concat (:uberjar-inclusions project))
+        whitelisted (select-keys project jar/whitelist-keys)
+        project (-> (project/unmerge-profiles project [:default])
+                    (merge whitelisted))
+        deps (->> (classpath/resolve-dependencies :dependencies project)
+                  (filter #(.endsWith (.getName %) ".jar")))]
+    (prn "deps:")
+    (doall (for [x deps] (prn x)))))
+
+(defn relativize [project] ;; cf pom.clj -- why make these things private?
+  (let [root (str (:root project) (System/getProperty "file.separator"))]
+    (reduce #(update-in %1 [%2]
+                        (fn [xs]
+                          (if (sequential? xs)
+                            (vec (for [x xs]
+                                   (.replace x root "")))
+                            (and xs (.replace xs root "")))))
+            project
+            [:target-path :compile-path :source-paths :test-paths
+             :resource-paths :java-source-paths])))
+
+(defn- distinct-key [k xs] ;; cf pom.clj
+  ((fn step [seen xs]
+     (lazy-seq
+      (if (seq xs)
+        (let [x (first xs), key (k x)]
+          (if (seen key)
+            (step seen (rest xs))
+            (cons x (step (conj seen key) (rest xs))))))))
+   #{} (seq xs)))
+
+(defn pom-deps
+  "cf uberjar.clj"
+  [project]
+  (let [profile-kws (project/non-leaky-profiles project)
+        project (-> project
+                    (project/unmerge-profiles profile-kws)
+                    (vary-meta assoc ::original-project project)
+                    relativize)
+        original-project (-> project meta ::original-project)
         profile-kws (concat
                      (set/difference
                       (set (project/non-leaky-profiles original-project))
@@ -97,12 +130,21 @@
                             original-project :provided))
                       (set (project/pom-scope-profiles
                             original-project :test))))
-        test-project 3 #_(-> original-project
-                             (project/unmerge-profiles profile-kws)
-                             (project/merge-profiles [:test])
-                             relativize)
+        test-project (-> original-project
+                         (project/unmerge-profiles profile-kws)
+                         (project/merge-profiles [:test])
+                         relativize)
         deps (:dependencies test-project)]
-    (prn original-project #_(map project/dependency-map deps)))
+    test-project))
+
+(defn lock
+  "I don't do a lot."
+  [project & args]
+  ;; Gives nil :(
+  #_(println "get-deps" (apply classpath/get-dependencies :dependencies project))
+  #_(prn  (map project/dependency-map (:dependencies project)))
+  (prn "Pom deps:")
+  (prn (pom-deps project))
   (let [infos (for [x (classpath/resolve-dependencies :dependencies project)]
                 (jar-info x (or (:local-repo project) default-local-repo)))
         infos-vec (->> (for [x (classpath/resolve-dependencies :dependencies project)]
@@ -111,12 +153,13 @@
                        (sort))
         flat (map parse-dependency-entry
                   (flatten-mapvals (classpath/dependency-hierarchy :dependencies project)))]
-    (prn "resolev:")
-    (doall (for [x infos] (prn x)))
-    (prn "hier:")
-    (doall (for [x flat] (prn x)))
+    #_(prn "resolev:")
+    #_(doall (for [x infos] (prn x)))
+    #_(prn "hier:")
+    #_(doall (for [x flat] (prn x)))
     (prn "both:")
-    (prn (merge-dep-info infos flat))
+    (doall (for [x (merge-dep-info infos flat)]
+             (prn ((juxt :group :artifact :version :jar-name :scope :sha) x))))
     #_(prn "count" [(count infos) (count flat)]))
   #_(println "deps: " (map (fn [x] [x ]) )) ; This isn't the maven-esque artifacts though, just jar files
   ;; This has scope and exclusions -- have to reverse engineer
