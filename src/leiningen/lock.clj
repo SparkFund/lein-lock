@@ -73,18 +73,27 @@
   "a left join, where info from new-list is merged over base-list. If no
   info is in new-list there is an error. (leftovers in new-list is
   ok). Used for getting more accurate :version :scope and :exclusions info from
-  eg resolve-dependencies"
+  eg resolve-dependencies.
+
+  Special logic for only overwriting version number if it's more precise
+  w.r.t. SNAPSHOT vs build numbers, otherwise new always overwrites base for
+  every key"
   [base-list new-list]
   (let [join-on (juxt :group :artifact)
-        new-lookup (into {} (map (juxt join-on identity) new-list))]
+        new-lookup (into {} (map (juxt join-on identity) new-list))
+        snap-check (fn [s o] ;; returns true if s is SNAPSHOT and otherwise matches o (o may have a more precise build number version)
+                     (and (re-find #"-SNAPSHOT$" (:version s)) ;; If our base has more precise build number version than SNAPSHOT, don't merge over it with less precise "SNAPSHOT" version
+                          (= (first (str/split (:version s) #"-"))
+                             (first (str/split (:version o) #"-")))))]
     (for [b base-list]
       (if-let [n (get new-lookup (join-on b))]
-        (do (assert (or (= (:version b) (:version n))
-                        (and (re-find #"-SNAPSHOT$" (:version b)) ;; we can narrow down SNAPSHOT to eg a build number
-                             (= (first (str/split (:version b) #"-"))
-                                (first (str/split (:version n) #"-")))))
-                    (str "Can't unify versions b: " (:version b) " and n: " (:version n)))
-            (merge b n))
+        (let [n (if (snap-check n b)
+                  (assoc n :version (:version b)) ;; If our base has more precise build number version than SNAPSHOT, don't merge over it with less precise "SNAPSHOT" version
+                  n)]
+          (assert (or (= (:version b) (:version n)) ;; we can narrow down SNAPSHOT to eg a build number
+                      (snap-check b n))
+                  (str "Can't unify versions " (:artifact b) " b: " (:version b) " and n: " (:version n)))
+          (merge b n))
         (throw (Exception. "No extra info found in new-list for " b))))))
 
 (defn uberjar-files
@@ -126,29 +135,6 @@
             (step seen (rest xs))
             (cons x (step (conj seen key) (rest xs))))))))
    #{} (seq xs)))
-
-(defn pom-deps
-  "cf uberjar.clj"
-  [project]
-  (let [profile-kws (project/non-leaky-profiles project)
-        project (-> project
-                    (project/unmerge-profiles profile-kws)
-                    (vary-meta assoc ::original-project project)
-                    relativize)
-        original-project (-> project meta ::original-project)
-        profile-kws (concat
-                     (set/difference
-                      (set (project/non-leaky-profiles original-project))
-                      (set (project/pom-scope-profiles
-                            original-project :provided))
-                      (set (project/pom-scope-profiles
-                            original-project :test))))
-        test-project (-> original-project
-                         (project/unmerge-profiles profile-kws)
-                         (project/merge-profiles [:test])
-                         relativize)
-        deps (:dependencies test-project)]
-    test-project))
 
 (defn silent-sh
   "throws on nonzero return code, returns out otherwise."
@@ -194,6 +180,38 @@
   (map parse-dependency-entry
        (flatten-mapvals (classpath/dependency-hierarchy :dependencies project))))
 
+(defn pom-dep-list
+  "this is created via classpath/dependency-hierarchy. We learn scope,
+  exclusions, and a more accurate version number, but we can't learn the jar
+  filename from this.
+
+  It includes test and runtime deps, excluding lein plugins. Can be used for
+  pinning test libs in the lockfile, not just runtime libs.
+
+  CAUTION: there is an increased chance you will uncover a transitive dependency
+  mismatch, as your :user dependencies will no longer be influencing the
+  selection :dev dependencies, so you may need to explicitly state versions for
+  on shared transitive deps like tools.namespace in your project.clj :dev profile."
+  [project]
+  (let [profile-kws (project/non-leaky-profiles project)
+        project (-> project
+                    (project/unmerge-profiles profile-kws)
+                    (vary-meta assoc ::original-project project)
+                    relativize)
+        original-project (-> project meta ::original-project)
+        profile-kws (concat
+                     (set/difference
+                      (set (project/non-leaky-profiles original-project))
+                      (set (project/pom-scope-profiles
+                            original-project :provided))
+                      (set (project/pom-scope-profiles
+                            original-project :test))))
+        test-project (-> original-project
+                         (project/unmerge-profiles profile-kws)
+                         (project/merge-profiles [:test])
+                         relativize)]
+    (dependency-hierarchy-dep-list test-project)))
+
 (defn resolve-dependencies-dep-list
   "this is created via classpath/resolve-dependencies. We get the jar filenames
   and shas but don't learn SNAPSHOT build version numbers, nor :scope nor :exclusions.
@@ -217,7 +235,7 @@
   [project & args]
   #_(build-war project)
 
-  (let [serialize #(ordered-select-keys % [:group :artifact :version :jar-name :sha]) ;; don't include scope as we focus on excluding test deps
+  (let [serialize #(ordered-select-keys % [:group :artifact :version :jar-name :scope :sha]) ;; don't include scope as we focus on excluding test deps
         ubers (uberjar-dep-list project)
         infos (resolve-dependencies-dep-list project)
         flat (dependency-hierarchy-dep-list project)]
@@ -230,4 +248,8 @@
     (println "big merged:")
     (doall (for [x (sort (map serialize (merge-dep-lists infos flat)))] (prn x)))
     (println "uber merged:")
-    (doall (for [x (sort (map serialize (merge-dep-lists ubers flat)))] (prn x)))))
+    (doall (for [x (sort (map serialize (merge-dep-lists ubers flat)))] (prn x)))
+    (println "pom deps:")
+    (doall (for [x (sort (map serialize (pom-dep-list project)))] (prn x)))
+    (println "pom merged:")
+    (doall (for [x (sort (map serialize (merge-dep-lists (pom-dep-list project) infos)))] (prn x)))))
