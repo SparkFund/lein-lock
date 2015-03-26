@@ -1,9 +1,13 @@
 (ns leiningen.lock
+  "checks transitive dependencies against a dependencies.lock file to ensure
+  repeatable builds."
   (:require [leiningen.core.classpath :as classpath]
+            [leiningen.core.main :as main]
             [leiningen.core.project :as project]
             [leiningen.clean :as clean]
             [leiningen.jar :as jar]
             [leiningen.pom :as pom]
+            [clojure.edn :as edn]
             [clojure.data :as data]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
@@ -92,7 +96,7 @@
                   n)]
           (assert (or (= (:version b) (:version n)) ;; we can narrow down SNAPSHOT to eg a build number
                       (snap-check b n))
-                  (str "Can't unify versions " (:artifact b) " b: " (:version b) " and n: " (:version n)))
+                  (str "Can't unify versions (possibly a :user profile dep is suggesting a different transitive dependency than :dev would, alone? Specifying a version explicitly in :dev might resolve the issue.) " (:artifact b) " b: " (:version b) " and n: " (:version n)))
           (merge b n))
         (throw (Exception. "No extra info found in new-list for " b))))))
 
@@ -135,35 +139,6 @@
             (step seen (rest xs))
             (cons x (step (conj seen key) (rest xs))))))))
    #{} (seq xs)))
-
-(defn silent-sh
-  "throws on nonzero return code, returns out otherwise."
-  [& args]
-  (let [{:keys [exit out]} (apply shell/sh args)]
-    (if (= 0 exit)
-      out
-      (throw (Exception. (str "Process failed, input: " args " out:\n" out))))))
-
-(defn build-war
-  "builds war via pom, cf
-  https://github.com/pedestal/docs/blob/master/documentation/service-war-deployment.md
-  (TODO Probably could be via lein uberjar + web.xml)"
-  [project]
-  (let [target-dir (io/file "target")
-        war-staging-dir (io/file target-dir "war")
-        inf-dir (io/file war-staging-dir "WEB-INF")
-        classdir (io/file inf-dir "classes")
-        output-war (io/file target-dir "hello-world-custom.war")]
-    (when (.exists war-staging-dir) (clean/delete-file-recursively war-staging-dir))
-    (pom/pom project)
-    (silent-sh "mvn" "dependency:copy-dependencies" (str "-DoutputDirectory=" (io/as-relative-path (io/file inf-dir "lib"))) "-DincludeScope=runtime")
-    (.mkdirs classdir)
-    (apply silent-sh "cp" "-R" (map io/as-relative-path (concat (.listFiles (io/file "src"))
-                                                                (.listFiles (io/file "config"))
-                                                                [classdir])))
-    (io/copy (io/file "web.xml") (io/file inf-dir (io/file "web.xml")))
-    (silent-sh "jar" "cvf" (io/as-relative-path output-war) "-C" (io/as-relative-path war-staging-dir) (.getName inf-dir))
-    (println "Wrote " (io/as-relative-path output-war))))
 
 (defn ordered-select-keys
   "returns vec of vec key pairs of a map. suitable for serializing keys in an order"
@@ -230,26 +205,77 @@
   (for [x (uberjar-files project)]
     (m2-jar-info (local-repo project) x)))
 
-(defn lock
-  "I don't do a lot."
-  [project & args]
-  #_(build-war project)
+(defn silent-sh ;; Used only by build-war
+  "throws on nonzero return code, returns out otherwise."
+  [& args]
+  (let [{:keys [exit out]} (apply shell/sh args)]
+    (if (= 0 exit)
+      out
+      (throw (Exception. (str "Process failed, input: " args " out:\n" out))))))
 
-  (let [serialize #(ordered-select-keys % [:group :artifact :version :jar-name :scope :sha]) ;; don't include scope as we focus on excluding test deps
-        ubers (uberjar-dep-list project)
-        infos (resolve-dependencies-dep-list project)
-        flat (dependency-hierarchy-dep-list project)]
-    (println "ubers:")
-    (doall (for [x (sort (map serialize ubers))] (prn x)))
-    (println "infos:")
-    (doall (for [x (sort (map serialize infos))] (prn x)))
-    (println "flat:")
-    (doall (for [x (sort (map serialize flat))] (prn x)))
-    (println "big merged:")
-    (doall (for [x (sort (map serialize (merge-dep-lists infos flat)))] (prn x)))
-    (println "uber merged:")
-    (doall (for [x (sort (map serialize (merge-dep-lists ubers flat)))] (prn x)))
-    (println "pom deps:")
-    (doall (for [x (sort (map serialize (pom-dep-list project)))] (prn x)))
-    (println "pom merged:")
-    (doall (for [x (sort (map serialize (merge-dep-lists (pom-dep-list project) infos)))] (prn x)))))
+(defn build-war
+  "builds war via pom, cf
+  https://github.com/pedestal/docs/blob/master/documentation/service-war-deployment.md
+  (TODO Probably could be via lein uberjar + web.xml)
+  (TODO Split into a different project!)"
+  [project]
+  (let [target-dir (io/file "target")
+        war-staging-dir (io/file target-dir "war")
+        inf-dir (io/file war-staging-dir "WEB-INF")
+        classdir (io/file inf-dir "classes")
+        output-war (io/file target-dir "hello-world-custom.war")]
+    (when (.exists war-staging-dir) (clean/delete-file-recursively war-staging-dir))
+    (pom/pom project)
+    (silent-sh "mvn" "dependency:copy-dependencies" (str "-DoutputDirectory=" (io/as-relative-path (io/file inf-dir "lib"))) "-DincludeScope=runtime")
+    (.mkdirs classdir)
+    (apply silent-sh "cp" "-R" (map io/as-relative-path (concat (.listFiles (io/file "src"))
+                                                                (.listFiles (io/file "config"))
+                                                                [classdir])))
+    (io/copy (io/file "web.xml") (io/file inf-dir (io/file "web.xml")))
+    (silent-sh "jar" "cvf" (io/as-relative-path output-war) "-C" (io/as-relative-path war-staging-dir) (.getName inf-dir))
+    (main/info "Wrote " (io/as-relative-path output-war))))
+
+(defn lock
+  "'lein lock' checks transitive dependencies against a dependencies.lock file
+  to ensure repeatable builds.
+
+  'lein lock freshen' will generate a new dependencies.lock file
+  This file should be checked into source control.
+
+  'lein lock echo' will print the contents stdout.
+
+  To customize via project.clj:
+  :lock {:lockfile \"different.lock\" ;defaults to dependencies.lock
+         :dep-profile :test} ; include :test scoped dependencies in lockfile. defaults to :uberjar
+  "
+  [project & [command]]
+  (let [lockfile (io/file (or (-> project :lock :lockfile) "dependencies.lock"))
+        serialize #(ordered-select-keys % [:group :artifact :version :jar-name :sha]) ;; don't include scope as we focus on excluding test deps, which will never have the "test" scope
+        [base exts] (let [dp (or (-> project :lock :dep-profile) :uberjar)]
+                      (case dp
+                        ;; including only uberjar picked deps:
+                        :uberjar [(uberjar-dep-list project) (dependency-hierarchy-dep-list project)]
+                        ;; vs including test libraries in the lockfile: (more strict, in that transitive dependencies can't resolve any :dev libs differently, even if they aren't going to end up in the final artifact)
+                        :test [(pom-dep-list project) (resolve-dependencies-dep-list project)]
+                        (throw (Exception. (str "Don't know :dep-profile " dp)))))
+        dep-list (merge-dep-lists base exts)
+        sorted-deps (sort (map serialize dep-list))]
+    (case command
+      "freshen" (do (with-open [w (clojure.java.io/writer lockfile)]
+                      (doseq [sd sorted-deps]
+                        (.write w (str sd))
+                        (.newLine w)))
+                    (main/info (io/as-relative-path lockfile) "refreshed."))
+      "echo" (doseq [x sorted-deps] (main/info (str x)))
+      nil (let [lock-entries (with-open [in (java.io.PushbackReader. (io/reader lockfile))]
+                               (loop [lock-entries []]
+                                 (let [le (edn/read {:eof ::eof} in)]
+                                   (if (= ::eof le)
+                                     lock-entries
+                                     (recur (conj lock-entries le))))))]
+            (doall (map (fn [idx sd le]
+                          (when (not= sd le) (main/abort "Mismatch on line" (inc idx) "\ncalculated dependency:\n" (str sd) "\ndoes not match lockfile entry:\n" (str le))))
+                        (range) sorted-deps lock-entries))
+            (main/info "Dependencies match lockfile."))
+      "uberwar" (build-war project) ;; Just here for now until we split off to its own lib!!!
+      (main/abort "Unknown command:" command "   try `lein lock freshen` or see `lein help lock`"))))
