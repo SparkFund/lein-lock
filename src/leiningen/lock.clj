@@ -1,21 +1,37 @@
 (ns leiningen.lock
   (:require [leiningen.core.classpath :as classpath]
             [leiningen.core.project :as project]
+            [leiningen.clean :as clean]
             [leiningen.jar :as jar]
-            [pandect.algo.sha1 :as pan]
+            [leiningen.pom :as pom]
             [clojure.data :as data]
             [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
             [clojure.set :as set]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [pandect.algo.sha1 :as pan]))
 
-(def default-local-repo ;; cf pomegranate/aether.clj
-  (io/file (System/getProperty "user.home") ".m2" "repository"))
+(defn local-repo
+  "cf pomegranate/aether.clj"
+  [project]
+  (or (:local-repo project)
+      (io/file (System/getProperty "user.home") ".m2" "repository")))
 
 (defn jar-info
-  "Breaks a jar deps path, assumes they're in a maven structured directory.
-  This info comes form (classpath/resolve-dependencies :dependencies project)
-  instead of dependency-hierarchy (which doesn't give us the jar files)."
-  [file local-repo]
+  "for jars not in a maven repo structure, eg staged for bundling in an uberjar/war.
+  :jar-name and :sha. use m2-jar-info if you can leverage the path higherarchy
+  for more info.  (Even though artifact name and version could often be guessed
+  from jar name, we don't try it.)"
+  [file]
+  {:jar-name (.getName file)
+   :sha (pan/sha1 file)})
+
+(defn m2-jar-info
+  "given a jar io/file in a maven-structured directory.
+  This info comes from eg (classpath/resolve-dependencies :dependencies project)
+  or uberjar-files -- (i.e. not dependency-hierarchy which doesn't give us the
+  jar files, only artifact/group/version etc)."
+  [local-repo file]
   (let [split-path (fn [file] (loop [f file
                                      acc (list (.getName file))]
                                 (if-let [p (.getParentFile f)]
@@ -53,29 +69,27 @@
      :scope (:scope kws)
      :exclusions (:exclusions kws)}))
 
-(defn merge-dep-info
-  "takes two lists of parsed dependency entries and reconciles them 1:1 (to
-  unify jar+hash from and :scope+:exclusions info) -- any leftovers or mismatch
-  on group+artifact+version means something is missing from one side or the
-  other."
-  [hierarchy-list resolve-list]
-  (let [join-on (juxt :group :artifact :version)]
-    (assert (= (count hierarchy-list)
-               (count resolve-list)) "Dep lists differ in size")
-    (map (fn [h r]
-           (assert (or (= (join-on h) (join-on r))
-                       (and (re-find #"-SNAPSHOT$" (:version h))  ;; resolve lists get dates as minor version numbers instead of SNAPSHOT, not sure who supplies this?
-                            (= (:group h) (:group r))
-                            (= (:artifact h) (:artifact r))
-                            (= (first (str/split (:version h) #"-"))
-                               (first (str/split (:version r) #"-")))))
-                   (str "Deps don't align:" {:h h :r r}))
-           (merge h r))
-         (sort-by join-on hierarchy-list)
-         (sort-by join-on resolve-list))))
+(defn merge-dep-lists
+  "a left join, where info from new-list is merged over base-list. If no
+  info is in new-list there is an error. (leftovers in new-list is
+  ok). Used for getting more accurate :version :scope and :exclusions info from
+  eg resolve-dependencies"
+  [base-list new-list]
+  (let [join-on (juxt :group :artifact)
+        new-lookup (into {} (map (juxt join-on identity) new-list))]
+    (for [b base-list]
+      (if-let [n (get new-lookup (join-on b))]
+        (do (assert (or (= (:version b) (:version n))
+                        (and (re-find #"-SNAPSHOT$" (:version b)) ;; we can narrow down SNAPSHOT to eg a build number
+                             (= (first (str/split (:version b) #"-"))
+                                (first (str/split (:version n) #"-")))))
+                    (str "Can't unify versions b: " (:version b) " and n: " (:version n)))
+            (merge b n))
+        (throw (Exception. "No extra info found in new-list for " b))))))
 
-(defn uberjar-jars
-  "cf uberjar.clj"
+(defn uberjar-files
+  "cf uberjar.clj, returns fully-qualified list of jar io/files that would be
+  included in eg an ubjerar or war (excluding test and plugin deps)"
   [project]
   (let [scoped-profiles (set (project/pom-scope-profiles project :provided))
         default-profiles (set (project/expand-profile project :default))
@@ -89,10 +103,9 @@
                     (merge whitelisted))
         deps (->> (classpath/resolve-dependencies :dependencies project)
                   (filter #(.endsWith (.getName %) ".jar")))]
-    (prn "deps:")
-    (doall (for [x deps] (prn x)))))
+    deps))
 
-(defn relativize [project] ;; cf pom.clj -- why make these things private?
+(defn relativize [project] ;; cf pom.clj
   (let [root (str (:root project) (System/getProperty "file.separator"))]
     (reduce #(update-in %1 [%2]
                         (fn [xs]
@@ -137,32 +150,84 @@
         deps (:dependencies test-project)]
     test-project))
 
+(defn silent-sh
+  "throws on nonzero return code, returns out otherwise."
+  [& args]
+  (let [{:keys [exit out]} (apply shell/sh args)]
+    (if (= 0 exit)
+      out
+      (throw (Exception. (str "Process failed, input: " args " out:\n" out))))))
+
+(defn build-war
+  "builds war via pom, cf
+  https://github.com/pedestal/docs/blob/master/documentation/service-war-deployment.md
+  (TODO Probably could be via lein uberjar + web.xml)"
+  [project]
+  (let [target-dir (io/file "target")
+        war-staging-dir (io/file target-dir "war")
+        inf-dir (io/file war-staging-dir "WEB-INF")
+        classdir (io/file inf-dir "classes")
+        output-war (io/file target-dir "hello-world-custom.war")]
+    (when (.exists war-staging-dir) (clean/delete-file-recursively war-staging-dir))
+    (pom/pom project)
+    (silent-sh "mvn" "dependency:copy-dependencies" (str "-DoutputDirectory=" (io/as-relative-path (io/file inf-dir "lib"))) "-DincludeScope=runtime")
+    (.mkdirs classdir)
+    (apply silent-sh "cp" "-R" (map io/as-relative-path (concat (.listFiles (io/file "src"))
+                                                                (.listFiles (io/file "config"))
+                                                                [classdir])))
+    (io/copy (io/file "web.xml") (io/file inf-dir (io/file "web.xml")))
+    (silent-sh "jar" "cvf" (io/as-relative-path output-war) "-C" (io/as-relative-path war-staging-dir) (.getName inf-dir))
+    (println "Wrote " (io/as-relative-path output-war))))
+
+(defn ordered-select-keys
+  "returns vec of vec key pairs of a map. suitable for serializing keys in an order"
+  [m keys]
+  (vec (for [k keys] [k (get m k)])))
+
+(defn dependency-hierarchy-dep-list
+  "this is created via classpath/dependency-hierarchy. We learn scope,
+  exclusions, and a more accurate version number, but we can't learn the jar
+  filename from this. Useful for merging into uberjars merge-dep-lists
+
+  It includes all deps, including testing and plugin deps."
+  [project]
+  (map parse-dependency-entry
+       (flatten-mapvals (classpath/dependency-hierarchy :dependencies project))))
+
+(defn resolve-dependencies-dep-list
+  "this is created via classpath/resolve-dependencies. We get the jar filenames
+  and shas but don't learn SNAPSHOT build version numbers, nor :scope nor :exclusions.
+
+  It includes all deps, including testing and plugin deps."
+  [project]
+  (for [x (classpath/resolve-dependencies :dependencies project)]
+    (m2-jar-info (local-repo project) x)))
+
+(defn uberjar-dep-list
+  "this is created via classpath/resolve-dependencies. We get the jar filenames
+  and shas but don't learn SNAPSHOT build version numbers, nor :scope nor :exclusions.
+
+  It mimics the logic of uberjar, so will not include plugin or test deps."
+  [project]
+  (for [x (uberjar-files project)]
+    (m2-jar-info (local-repo project) x)))
+
 (defn lock
   "I don't do a lot."
   [project & args]
-  ;; Gives nil :(
-  #_(println "get-deps" (apply classpath/get-dependencies :dependencies project))
-  #_(prn  (map project/dependency-map (:dependencies project)))
-  (prn "Pom deps:")
-  (prn (pom-deps project))
-  (let [infos (for [x (classpath/resolve-dependencies :dependencies project)]
-                (jar-info x (or (:local-repo project) default-local-repo)))
-        infos-vec (->> (for [x (classpath/resolve-dependencies :dependencies project)]
-                         ((juxt #(str/join "." (:group %)) :jar-name :sha)
-                          (jar-info x (or (:local-repo project) default-local-repo))))
-                       (sort))
-        flat (map parse-dependency-entry
-                  (flatten-mapvals (classpath/dependency-hierarchy :dependencies project)))]
-    #_(prn "resolev:")
-    #_(doall (for [x infos] (prn x)))
-    #_(prn "hier:")
-    #_(doall (for [x flat] (prn x)))
-    (prn "both:")
-    (doall (for [x (merge-dep-info infos flat)]
-             (prn ((juxt :group :artifact :version :jar-name :scope :sha) x))))
-    #_(prn "count" [(count infos) (count flat)]))
-  #_(println "deps: " (map (fn [x] [x ]) )) ; This isn't the maven-esque artifacts though, just jar files
-  ;; This has scope and exclusions -- have to reverse engineer
-  #_(println "tree: " (classpath/dependency-hierarchy :dependencies project)) ; this is a funny symbol nested list
-                                        ; this is a funny symbol nested list
-  )
+  #_(build-war project)
+
+  (let [serialize #(ordered-select-keys % [:group :artifact :version :jar-name :sha]) ;; don't include scope as we focus on excluding test deps
+        ubers (uberjar-dep-list project)
+        infos (resolve-dependencies-dep-list project)
+        flat (dependency-hierarchy-dep-list project)]
+    (println "ubers:")
+    (doall (for [x (sort (map serialize ubers))] (prn x)))
+    (println "infos:")
+    (doall (for [x (sort (map serialize infos))] (prn x)))
+    (println "flat:")
+    (doall (for [x (sort (map serialize flat))] (prn x)))
+    (println "big merged:")
+    (doall (for [x (sort (map serialize (merge-dep-lists infos flat)))] (prn x)))
+    (println "uber merged:")
+    (doall (for [x (sort (map serialize (merge-dep-lists ubers flat)))] (prn x)))))
